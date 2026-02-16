@@ -28,6 +28,7 @@ Please specify the group members here
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
@@ -72,11 +73,89 @@ void *client_thread_func(void *arg) {
      * It sends messages to the server, waits for a response using epoll,
      * and measures the round-trip time (RTT) of this request-response.
      */
- 
+    if (data == NULL || data->socket_fd < 0 || data->epoll_fd < 0) {
+        return NULL;
+    }
+
+    event.events = EPOLLIN;
+    event.data.fd = data->socket_fd;
+    if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) < 0) {
+        perror("epoll_ctl");
+        close(data->socket_fd);
+        close(data->epoll_fd);
+        data->socket_fd = -1;
+        data->epoll_fd = -1;
+        return NULL;
+    }
+
+    for (int req = 0; req < num_requests; req++) {
+        ssize_t sent = 0;
+        ssize_t received = 0;
+
+        gettimeofday(&start, NULL);
+
+        while (sent < MESSAGE_SIZE) {
+            ssize_t n = send(data->socket_fd, send_buf + sent, MESSAGE_SIZE - sent, 0);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("send");
+                goto out;
+            }
+            if (n == 0) goto out;
+            sent += n;
+        }
+
+        while (received < MESSAGE_SIZE) {
+            int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
+            if (nfds < 0) {
+                if (errno == EINTR) continue;
+                perror("epoll_wait");
+                goto out;
+            }
+
+            for (int i = 0; i < nfds; i++) {
+                if (events[i].data.fd != data->socket_fd) continue;
+                if (events[i].events & (EPOLLERR | EPOLLHUP)) goto out;
+
+                if (events[i].events & EPOLLIN) {
+                    ssize_t r = recv(data->socket_fd, recv_buf + received, MESSAGE_SIZE - received, 0);
+                    if (r == 0) goto out;
+                    if (r < 0) {
+                        if (errno == EINTR) continue;
+                        perror("recv");
+                        goto out;
+                    }
+                    received += r;
+                }
+            }
+        }
+
+        gettimeofday(&end, NULL);
+        long long rtt_us = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
+        data->total_rtt += rtt_us;
+        data->total_messages++;
+
+        if (memcmp(send_buf, recv_buf, MESSAGE_SIZE) != 0) {
+            fprintf(stderr, "client_thread: echo mismatch\n");
+            goto out;
+        }
+    }
+
     /* TODO:
      * The function exits after sending and receiving a predefined number of messages (num_requests). 
      * It calculates the request rate based on total messages and RTT
      */
+out:
+    if (data->total_rtt > 0) {
+        data->request_rate = (float)data->total_messages / ((float)data->total_rtt / 1000000.0f);
+    } else {
+        data->request_rate = 0;
+    }
+
+    close(data->socket_fd);
+    close(data->epoll_fd);
+    data->socket_fd = -1;
+    data->epoll_fd = -1;
 
     return NULL;
 }
@@ -88,29 +167,99 @@ void *client_thread_func(void *arg) {
 void run_client() {
 
     long long total_rtt = 0;       // Added this
-    long total_messages = 1;      // Added this (set to 1 to avoid divide-by-zero)
+    long total_messages = 0;      // Added this
     float total_request_rate = 0; // Added this
     
     pthread_t threads[num_client_threads];
     client_thread_data_t thread_data[num_client_threads];
+    int thread_created[num_client_threads];
     struct sockaddr_in server_addr;
 
     /* TODO:
      * Create sockets and epoll instances for client threads
      * and connect these sockets of client threads to the server
      */
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        perror("inet_pton");
+        return;
+    }
     
     // Hint: use thread_data to save the created socket and epoll instance for each thread
     // You will pass the thread_data to pthread_create() as below
+    int created_count = 0;
     for (int i = 0; i < num_client_threads; i++) {
-        pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
+        thread_created[i] = 0;
+        thread_data[i].socket_fd = -1;
+        thread_data[i].epoll_fd = -1;
+        thread_data[i].total_rtt = 0;
+        thread_data[i].total_messages = 0;
+        thread_data[i].request_rate = 0;
+
+        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            perror("socket");
+            continue;
+        }
+
+        if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            perror("connect");
+            close(sockfd);
+            continue;
+        }
+
+        int epfd = epoll_create1(0);
+        if (epfd < 0) {
+            perror("epoll_create1");
+            close(sockfd);
+            continue;
+        }
+
+        thread_data[i].socket_fd = sockfd;
+        thread_data[i].epoll_fd = epfd;
+
+        int rc = pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
+        if (rc != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+            close(sockfd);
+            close(epfd);
+            thread_data[i].socket_fd = -1;
+            thread_data[i].epoll_fd = -1;
+            continue;
+        }
+
+        thread_created[i] = 1;
+        created_count++;
     }
 
     /* TODO:
      * Wait for client threads to complete and aggregate metrics of all client threads
      */
+    if (created_count == 0) {
+        fprintf(stderr, "No client threads created\n");
+        return;
+    }
 
-    printf("Average RTT: %lld us\n", total_rtt / total_messages);
+    for (int i = 0; i < num_client_threads; i++) {
+        if (!thread_created[i]) continue;
+        pthread_join(threads[i], NULL);
+
+        long long avg_rtt = thread_data[i].total_messages ? (thread_data[i].total_rtt / thread_data[i].total_messages) : 0;
+        printf("Thread %d Average RTT: %lld us\n", i, avg_rtt);
+        printf("Thread %d Request Rate: %f messages/s\n", i, thread_data[i].request_rate);
+
+        total_rtt += thread_data[i].total_rtt;
+        total_messages += thread_data[i].total_messages;
+        total_request_rate += thread_data[i].request_rate;
+    }
+
+    if (total_messages > 0) {
+        printf("Average RTT: %lld us\n", total_rtt / total_messages);
+    } else {
+        printf("Average RTT: 0 us\n");
+    }
     printf("Total Request Rate: %f messages/s\n", total_request_rate);
 }
 
